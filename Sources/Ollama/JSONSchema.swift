@@ -1,14 +1,41 @@
 import Foundation
 
+/// A protocol that types can conform to to provide an example instance for schema generation.
+///
+/// Types conforming to this protocol can provide an example instance that will be used
+/// to automatically generate a JSON schema. This is the recommended approach for types
+/// with required properties, as it guarantees accurate schema generation.
+///
+/// - Example:
+/// ```swift
+/// struct Country: Codable, JSONSchemaExample {
+///     let name: String
+///     let capital: String
+///     let languages: [String]
+///     
+///     static var example: Country {
+///         Country(
+///             name: "Canada",
+///             capital: "Ottawa",
+///             languages: ["English", "French"]
+///         )
+///     }
+/// }
+/// ```
+public protocol JSONSchemaExample {
+    /// An example instance of this type used to generate the JSON schema.
+    static var example: Self { get }
+}
+
 /// A protocol that types can conform to to provide their JSON schema representation.
 ///
 /// Types conforming to this protocol can provide a custom JSON schema
 /// that will be used when generating structured outputs.
 ///
 /// **Note:** For many simple types, you don't need to implement this protocol!
-/// The `JSONSchemaGenerator` can automatically generate schemas for types where:
-/// - All properties are optional (can be decoded from empty JSON `{}`)
-/// - The type structure can be inferred via runtime introspection
+/// The `JSONSchemaGenerator` can automatically generate schemas using:
+/// - `JSONSchemaExample` protocol (recommended for types with required properties)
+/// - Automatic introspection (works for types with all optional properties)
 ///
 /// **Important:** When using automatic schema generation, all properties are marked as
 /// `required` in the JSON schema (even if they're optional in Swift). This ensures the
@@ -20,7 +47,31 @@ import Foundation
 /// - You want to add descriptions, constraints, or other schema metadata
 /// - Automatic generation doesn't work for your specific type
 ///
-/// - Example with automatic schema generation (no jsonSchema needed):
+/// - Example with JSONSchemaExample (recommended for required properties):
+/// ```swift
+/// struct Country: Codable, JSONSchemaExample {
+///     let name: String
+///     let capital: String
+///     let languages: [String]
+///     
+///     static var example: Country {
+///         Country(
+///             name: "Canada",
+///             capital: "Ottawa",
+///             languages: ["English", "French"]
+///         )
+///     }
+/// }
+///
+/// // Schema is automatically generated from the example!
+/// let (country, _) = try await client.chat(
+///     model: "llama3.2",
+///     messages: [.user("Tell me about Canada.")],
+///     responseType: Country.self
+/// )
+/// ```
+///
+/// - Example with automatic schema generation (for optional properties):
 /// ```swift
 /// struct Country: Codable {
 ///     let name: String?
@@ -29,7 +80,6 @@ import Foundation
 /// }
 ///
 /// // Schema is automatically generated with all fields marked as required!
-/// // This ensures the model returns name, capital, and languages.
 /// let (country, _) = try await client.chat(
 ///     model: "llama3.2",
 ///     messages: [.user("Tell me about Canada.")],
@@ -73,23 +123,30 @@ public enum JSONSchemaGenerator {
     /// and uses its custom schema. Otherwise, it attempts to automatically generate
     /// a schema by analyzing the type structure using runtime introspection.
     ///
-    /// **Automatic schema generation works best when:**
-    /// - All properties in your type are optional (can decode from `{}`)
-    /// - Your type uses standard Swift types (String, Int, Double, Bool, Array, etc.)
+    /// **Automatic schema generation works in this order:**
+    /// 1. If type conforms to `JSONSchemaExample` - uses the example instance (works for all types!)
+    /// 2. If all properties are optional - can decode from `{}` and introspect
+    /// 3. Otherwise - attempts heuristics (may not always succeed)
     ///
-    /// For types with required properties, consider implementing `JSONSchemaRepresentable`
-    /// to provide a custom schema with proper `required` fields.
+    /// **Recommended approach:** Conform to `JSONSchemaExample` for types with required properties.
+    /// This guarantees accurate schema generation without manual schema definition.
     ///
     /// - Parameter type: The Codable type to generate a schema for
     /// - Returns: A JSON schema as a `Value` object
     /// - Throws: An error if the schema cannot be generated
     public static func schema<T: Codable>(for type: T.Type) throws -> Value {
-        // If the type conforms to JSONSchemaRepresentable, use its custom schema
+        // Priority 1: If the type conforms to JSONSchemaRepresentable, use its custom schema
         if let representable = type as? any JSONSchemaRepresentable.Type {
             return representable.jsonSchema
         }
         
-        // Otherwise, generate schema from Codable introspection
+        // Priority 2: If the type conforms to JSONSchemaExample, use the example to generate schema
+        if let exampleType = type as? any JSONSchemaExample.Type {
+            let exampleInstance = exampleType.example
+            return try schemaFromInstance(exampleInstance as! T)
+        }
+        
+        // Priority 3: Otherwise, generate schema from Codable introspection
         return try generateSchema(for: type)
     }
     
@@ -333,6 +390,32 @@ extension JSONSchemaGenerator {
     /// - Throws: An error if the schema cannot be generated
     public static func schema<T: Codable>(from instance: T) throws -> Value {
         return try schema(for: type(of: instance))
+    }
+    
+    /// Generates a JSON schema from a type that provides an example instance.
+    ///
+    /// This is similar to the `derivedJsonSchema` method in other SDKs.
+    /// The type must conform to `JSONSchemaExample` to provide an example instance.
+    ///
+    /// - Parameter type: A type conforming to `JSONSchemaExample`
+    /// - Returns: A JSON schema as a `Value` object
+    /// - Throws: An error if the schema cannot be generated
+    ///
+    /// - Example:
+    /// ```swift
+    /// struct Country: Codable, JSONSchemaExample {
+    ///     let name: String
+    ///     let capital: String
+    ///     
+    ///     static var example: Country {
+    ///         Country(name: "Canada", capital: "Ottawa")
+    ///     }
+    /// }
+    ///
+    /// let schema = try JSONSchemaGenerator.derivedJsonSchema(Country.self)
+    /// ```
+    public static func derivedJsonSchema<T: Codable & JSONSchemaExample>(_ type: T.Type) throws -> Value {
+        return try schema(for: type)
     }
 }
 
