@@ -175,8 +175,66 @@ do {
 ### Using Structured Outputs
 
 You can request structured outputs from models by specifying a format.
-Pass `"json"` to get back a JSON string,
-or specify a full [JSON Schema](https://json-schema.org):
+The library provides several ways to generate JSON schemas automatically from your Swift types,
+making it easy to get structured responses without manually writing schemas.
+
+#### Automatic Schema Generation (Recommended)
+
+The easiest way to use structured outputs is to define a Swift type and let the library
+automatically generate the JSON schema. This works in two ways:
+
+**1. Using `JSONSchemaExample` (for types with required properties):**
+
+```swift
+import Ollama
+
+struct Country: Codable, JSONSchemaExample {
+    let name: String
+    let capital: String
+    let languages: [String]
+    
+    static var example: Country {
+        Country(
+            name: "Canada",
+            capital: "Ottawa",
+            languages: ["English", "French"]
+        )
+    }
+}
+
+// Schema is automatically generated from the example!
+// The response is automatically decoded to your type
+let (country, _) = try await client.chat(
+    model: "llama3.2",
+    messages: [.user("Tell me about Canada.")],
+    responseType: Country.self
+)
+
+print(country.name)      // "Canada"
+print(country.capital)   // "Ottawa"
+print(country.languages) // ["English", "French"]
+```
+
+**2. Automatic generation for optional properties:**
+
+```swift
+struct Color: Codable {
+    let name: String?
+    let hex: String?
+    let rgb: [Int]?
+}
+
+// Works automatically - no example needed!
+let (color, _) = try await client.chat(
+    model: "llama3.2",
+    messages: [.user("Give me a color and its hex code.")],
+    responseType: Color.self
+)
+```
+
+#### Manual Schema Definition
+
+You can also manually specify a JSON schema for full control:
 
 ```swift
 // Simple JSON format
@@ -221,7 +279,64 @@ let response = try await client.chat(
 // }
 ```
 
-The format parameter works with both `chat` and `generate` methods.
+#### Custom Schema with `JSONSchemaRepresentable`
+
+For advanced use cases, you can provide a custom schema:
+
+```swift
+struct Country: Codable, JSONSchemaRepresentable {
+    let name: String
+    let capital: String
+    let languages: [String]
+    
+    static var jsonSchema: Value {
+        [
+            "type": "object",
+            "properties": [
+                "name": ["type": "string", "description": "Country name"],
+                "capital": ["type": "string", "description": "Capital city"],
+                "languages": [
+                    "type": "array",
+                    "items": ["type": "string"],
+                    "description": "Official languages"
+                ]
+            ],
+            "required": ["name", "capital", "languages"]
+        ]
+    }
+}
+
+let (country, _) = try await client.chat(
+    model: "llama3.2",
+    messages: [.user("Tell me about Canada.")],
+    responseType: Country.self
+)
+```
+
+#### Using with `generate` method
+
+Structured outputs also work with the `generate` method:
+
+```swift
+struct Joke: Codable, JSONSchemaExample {
+    let setup: String
+    let punchline: String
+    
+    static var example: Joke {
+        Joke(setup: "Why did the Swift developer...", punchline: "Because...")
+    }
+}
+
+let (joke, _) = try await client.generate(
+    model: "llama3.2",
+    prompt: "Tell me a programming joke.",
+    responseType: Joke.self
+)
+```
+
+> [!TIP]
+> The format parameter works with both `chat` and `generate` methods, including their streaming variants.
+> For streaming responses, the library accumulates the content and decodes the final JSON when complete.
 
 ### Using Thinking Models
 
