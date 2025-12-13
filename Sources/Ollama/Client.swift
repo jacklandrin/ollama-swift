@@ -193,7 +193,7 @@ public final class Client: Sendable {
                 }
             }
 
-            continuation.onTermination = { _ in
+            continuation.onTermination = { @Sendable _ in
                 task.cancel()
             }
         }
@@ -662,6 +662,321 @@ extension Client {
         }
 
         return params
+    }
+}
+
+// MARK: - Structured Outputs
+
+extension Client {
+    /// Generates the next message in a chat with structured output.
+    ///
+    /// This method automatically generates a JSON schema from the provided type
+    /// and uses it to constrain the model's output format.
+    ///
+    /// - Parameters:
+    ///   - model: The name of the model to use for the chat.
+    ///   - messages: The messages of the chat, used to keep a chat memory.
+    ///   - responseType: The Codable type that the response should conform to.
+    ///   - options: Additional model parameters as specified in the Modelfile documentation.
+    ///   - template: The prompt template to use (overrides what is defined in the Modelfile).
+    ///   - tools: Optional array of tools that can be called by the model.
+    ///   - think: If true, the model will think about the response before responding. Requires thinking support from the model.
+    ///   - keepAlive: Controls how long the model will stay loaded into memory following the request. Defaults to `.default` which uses the server's default (typically 5 minutes).
+    /// - Returns: A tuple containing the decoded response of type `ResponseType` and the original `ChatResponse`.
+    /// - Throws: An error if the request fails, the response cannot be decoded, or the schema cannot be generated.
+    ///
+    /// - Example:
+    /// ```swift
+    /// struct Country: Codable, JSONSchemaRepresentable {
+    ///     let name: String
+    ///     let capital: String
+    ///     let languages: [String]
+    ///     
+    ///     static var jsonSchema: Value {
+    ///         [
+    ///             "type": "object",
+    ///             "properties": [
+    ///                 "name": ["type": "string"],
+    ///                 "capital": ["type": "string"],
+    ///                 "languages": [
+    ///                     "type": "array",
+    ///                     "items": ["type": "string"]
+    ///                 ]
+    ///             ],
+    ///             "required": ["name", "capital", "languages"]
+    ///         ]
+    ///     }
+    /// }
+    ///
+    /// let (country, response) = try await client.chat(
+    ///     model: "llama3.2",
+    ///     messages: [.user("Tell me about Canada.")],
+    ///     responseType: Country.self
+    /// )
+    /// ```
+    public func chat<ResponseType: Codable>(
+        model: Model.ID,
+        messages: [Chat.Message],
+        responseType: ResponseType.Type,
+        options: [String: Value]? = nil,
+        template: String? = nil,
+        tools: [any ToolProtocol]? = nil,
+        think: Bool? = nil,
+        keepAlive: KeepAlive = .default
+    ) async throws -> (response: ResponseType, rawResponse: ChatResponse) {
+        let schema = try JSONSchemaGenerator.schema(for: responseType)
+        let chatResponse = try await chat(
+            model: model,
+            messages: messages,
+            options: options,
+            template: template,
+            format: schema,
+            tools: tools,
+            think: think,
+            keepAlive: keepAlive
+        )
+        
+        let decoder = JSONDecoder()
+        let responseData = chatResponse.message.content.data(using: .utf8) ?? Data()
+        let decodedResponse = try decoder.decode(ResponseType.self, from: responseData)
+        
+        return (decodedResponse, chatResponse)
+    }
+    
+    /// Generates a streaming chat response with structured output.
+    ///
+    /// This method automatically generates a JSON schema from the provided type
+    /// and uses it to constrain the model's output format.
+    ///
+    /// - Parameters:
+    ///   - model: The name of the model to use for the chat.
+    ///   - messages: The messages of the chat, used to keep a chat memory.
+    ///   - responseType: The Codable type that the response should conform to.
+    ///   - options: Additional model parameters as specified in the Modelfile documentation.
+    ///   - template: The prompt template to use (overrides what is defined in the Modelfile).
+    ///   - tools: Optional array of tools that can be called by the model.
+    ///   - think: If true, the model will think about the response before responding. Requires thinking support from the model.
+    ///   - keepAlive: Controls how long the model will stay loaded into memory following the request. Defaults to `.default` which uses the server's default (typically 5 minutes).
+    /// - Returns: An async throwing stream of tuples containing decoded responses of type `ResponseType` and the original `ChatResponse`.
+    /// - Throws: An error if the request fails or the schema cannot be generated.
+    ///
+    /// - Note: For streaming responses, you'll need to accumulate the content chunks and decode the final complete JSON.
+    public func chatStream<ResponseType: Codable & Sendable>(
+        model: Model.ID,
+        messages: [Chat.Message],
+        responseType: ResponseType.Type,
+        options: [String: Value]? = nil,
+        template: String? = nil,
+        tools: [any ToolProtocol]? = nil,
+        think: Bool? = nil,
+        keepAlive: KeepAlive = .default
+    ) throws -> AsyncThrowingStream<(response: ResponseType?, rawResponse: ChatResponse), Swift.Error> {
+        let schema = try JSONSchemaGenerator.schema(for: responseType)
+        let stream = try chatStream(
+            model: model,
+            messages: messages,
+            options: options,
+            template: template,
+            format: schema,
+            tools: tools,
+            think: think,
+            keepAlive: keepAlive
+        )
+        
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                var accumulatedContent = ""
+                do {
+                    for try await chatResponse in stream {
+                        accumulatedContent += chatResponse.message.content
+                        
+                        // Try to decode if the response is done
+                        let decodedResponse: ResponseType? = {
+                            guard chatResponse.done else { return nil }
+                            guard let data = accumulatedContent.data(using: .utf8) else { return nil }
+                            return try? JSONDecoder().decode(ResponseType.self, from: data)
+                        }()
+                        
+                        continuation.yield((decodedResponse, chatResponse))
+                        
+                        if chatResponse.done {
+                            continuation.finish()
+                            return
+                        }
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
+    }
+}
+
+// MARK: - Structured Outputs for Generate
+
+extension Client {
+    /// Generates a response for a given prompt with structured output.
+    ///
+    /// This method automatically generates a JSON schema from the provided type
+    /// and uses it to constrain the model's output format.
+    ///
+    /// - Parameters:
+    ///   - model: The name of the model to use for generation.
+    ///   - prompt: The prompt to generate a response for.
+    ///   - responseType: The Codable type that the response should conform to.
+    ///   - images: Optional list of base64-encoded images (for multimodal models).
+    ///   - options: Additional model parameters as specified in the Modelfile documentation.
+    ///   - system: System message to override what is defined in the Modelfile.
+    ///   - template: The prompt template to use (overrides what is defined in the Modelfile).
+    ///   - context: The context parameter returned from a previous request to keep a short conversational memory.
+    ///   - raw: If true, no formatting will be applied to the prompt.
+    ///   - think: If true, the model will think about the response before responding. Requires thinking support from the model.
+    ///   - keepAlive: Controls how long the model will stay loaded into memory following the request. Defaults to `.default` which uses the server's default (typically 5 minutes).
+    /// - Returns: A tuple containing the decoded response of type `ResponseType` and the original `GenerateResponse`.
+    /// - Throws: An error if the request fails, the response cannot be decoded, or the schema cannot be generated.
+    ///
+    /// - Example:
+    /// ```swift
+    /// struct Color: Codable, JSONSchemaRepresentable {
+    ///     let name: String
+    ///     let hex: String
+    ///     
+    ///     static var jsonSchema: Value {
+    ///         [
+    ///             "type": "object",
+    ///             "properties": [
+    ///                 "name": ["type": "string"],
+    ///                 "hex": ["type": "string"]
+    ///             ],
+    ///             "required": ["name", "hex"]
+    ///         ]
+    ///     }
+    /// }
+    ///
+    /// let (color, response) = try await client.generate(
+    ///     model: "llama3.2",
+    ///     prompt: "Give me a color and its hex code.",
+    ///     responseType: Color.self
+    /// )
+    /// ```
+    public func generate<ResponseType: Codable>(
+        model: Model.ID,
+        prompt: String,
+        responseType: ResponseType.Type,
+        images: [Data]? = nil,
+        options: [String: Value]? = nil,
+        system: String? = nil,
+        template: String? = nil,
+        context: [Int]? = nil,
+        raw: Bool = false,
+        think: Bool? = nil,
+        keepAlive: KeepAlive = .default
+    ) async throws -> (response: ResponseType, rawResponse: GenerateResponse) {
+        let schema = try JSONSchemaGenerator.schema(for: responseType)
+        let generateResponse = try await generate(
+            model: model,
+            prompt: prompt,
+            images: images,
+            format: schema,
+            options: options,
+            system: system,
+            template: template,
+            context: context,
+            raw: raw,
+            think: think,
+            keepAlive: keepAlive
+        )
+        
+        let decoder = JSONDecoder()
+        let responseData = generateResponse.response.data(using: .utf8) ?? Data()
+        let decodedResponse = try decoder.decode(ResponseType.self, from: responseData)
+        
+        return (decodedResponse, generateResponse)
+    }
+    
+    /// Generates a streaming response for a given prompt with structured output.
+    ///
+    /// This method automatically generates a JSON schema from the provided type
+    /// and uses it to constrain the model's output format.
+    ///
+    /// - Parameters:
+    ///   - model: The name of the model to use for generation.
+    ///   - prompt: The prompt to generate a response for.
+    ///   - responseType: The Codable type that the response should conform to.
+    ///   - images: Optional list of base64-encoded images (for multimodal models).
+    ///   - options: Additional model parameters as specified in the Modelfile documentation.
+    ///   - system: System message to override what is defined in the Modelfile.
+    ///   - template: The prompt template to use (overrides what is defined in the Modelfile).
+    ///   - context: The context parameter returned from a previous request to keep a short conversational memory.
+    ///   - raw: If true, no formatting will be applied to the prompt.
+    ///   - think: If true, the model will think about the response before responding. Requires thinking support from the model.
+    ///   - keepAlive: Controls how long the model will stay loaded into memory following the request. Defaults to `.default` which uses the server's default (typically 5 minutes).
+    /// - Returns: An async throwing stream of tuples containing decoded responses of type `ResponseType` and the original `GenerateResponse`.
+    /// - Throws: An error if the request fails or the schema cannot be generated.
+    ///
+    /// - Note: For streaming responses, you'll need to accumulate the response chunks and decode the final complete JSON.
+    public func generateStream<ResponseType: Codable & Sendable>(
+        model: Model.ID,
+        prompt: String,
+        responseType: ResponseType.Type,
+        images: [Data]? = nil,
+        options: [String: Value]? = nil,
+        system: String? = nil,
+        template: String? = nil,
+        context: [Int]? = nil,
+        raw: Bool = false,
+        think: Bool? = nil,
+        keepAlive: KeepAlive = .default
+    ) throws -> AsyncThrowingStream<(response: ResponseType?, rawResponse: GenerateResponse), Swift.Error> {
+        let schema = try JSONSchemaGenerator.schema(for: responseType)
+        let stream = generateStream(
+            model: model,
+            prompt: prompt,
+            images: images,
+            format: schema,
+            options: options,
+            system: system,
+            template: template,
+            context: context,
+            raw: raw,
+            think: think,
+            keepAlive: keepAlive
+        )
+        
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                var accumulatedResponse = ""
+                do {
+                    for try await generateResponse in stream {
+                        accumulatedResponse += generateResponse.response
+                        
+                        // Try to decode if the response is done
+                        let decodedResponse: ResponseType? = {
+                            guard generateResponse.done else { return nil }
+                            guard let data = accumulatedResponse.data(using: .utf8) else { return nil }
+                            return try? JSONDecoder().decode(ResponseType.self, from: data)
+                        }()
+                        
+                        continuation.yield((decodedResponse, generateResponse))
+                        
+                        if generateResponse.done {
+                            continuation.finish()
+                            return
+                        }
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            
+            continuation.onTermination = { @Sendable _ in
+                task.cancel()
+            }
+        }
     }
 }
 
